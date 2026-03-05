@@ -1,12 +1,21 @@
-name: Scrape Mercado Livre Offers
+name: Scrape Mercado Livre Offers (Pages)
 
 on:
   schedule:
-    - cron: "0 11 * * *"
+    - cron: "0 11 * * *"   # 08:00 BRT (UTC 11)
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
 jobs:
-  run-scraper:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -18,21 +27,33 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci || npm install
 
-      - name: Install Playwright
+      - name: Install Playwright Chromium (with deps)
         run: npx playwright install --with-deps chromium
 
-      - name: Run scraper
+      - name: Generate resultado.json
         run: |
-          node mercadolivre-scraper.mjs > docs/resultado.json
+          mkdir -p public
+          node mercadolivre-scraper.mjs > public/resultado.json
 
-      - name: Commit JSON
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git add docs/resultado.json
-          git commit -m "update resultado.json" || echo "no changes"
-          git push
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
