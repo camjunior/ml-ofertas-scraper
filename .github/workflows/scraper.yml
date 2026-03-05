@@ -2,7 +2,7 @@ name: Scrape Mercado Livre Offers
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # 08:00 BRT (UTC 11)
+    - cron: "0 11 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -18,21 +18,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: npm install
 
-      - name: Install Playwright Chromium (with deps)
+      - name: Install Playwright
         run: npx playwright install --with-deps chromium
 
       - name: Run scraper
         run: |
-          mkdir -p out
-          node mercadolivre-scraper.mjs > out/resultado.json
+          node mercadolivre-scraper.mjs > docs/resultado.json
 
-      - name: Upload artifact (resultado.json)
-        uses: actions/upload-artifact@v4
-        with:
-          name: resultado-json
-          path: out/resultado.json
+      - name: Commit JSON
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add docs/resultado.json
+          git commit -m "update resultado.json" || echo "no changes"
+          git push
