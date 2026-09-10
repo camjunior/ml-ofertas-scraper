@@ -1,5 +1,6 @@
 
-import { chromium } from "playwright";
+import { pathToFileURL } from "node:url";
+import { toNumberFromBRL, toNumberFromJson, computeDiscountPercent } from "./prices.mjs";
 
 /* ---------------- utils ---------------- */
 
@@ -50,42 +51,6 @@ function extractProductIdFromUrl(url) {
   return null;
 }
 
-// parse BR money
-function toNumberFromBRL(text) {
-  if (!text) return null;
-
-  let s = String(text)
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/[^\d.,-]/g, "");
-
-  if (!s) return null;
-
-  const hasComma = s.includes(",");
-  const hasDot = s.includes(".");
-
-  // Sem vírgula e com ponto => ponto é milhar (1.199, 12.990, 1.234.567)
-  if (!hasComma && hasDot) {
-    s = s.replace(/\./g, "");
-  } else if (hasComma && hasDot) {
-    // 1.234,56 -> 1234.56
-    s = s.replace(/\./g, "").replace(",", ".");
-  } else if (hasComma && !hasDot) {
-    // 1234,56 -> 1234.56
-    s = s.replace(",", ".");
-  }
-
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
-}
-
-function computeDiscountPercent(original, current) {
-  if (original == null || current == null) return null;
-  if (!(original > 0) || !(current > 0)) return null;
-  if (current >= original) return 0;
-  return Math.round(((original - current) / original) * 100);
-}
-
 function isLikelyProductUrl(url) {
   if (!url) return false;
   // evita anchors e páginas genéricas
@@ -127,7 +92,7 @@ async function autoScroll(page, { maxRounds = 35, idleRoundsToStop = 4, step = 1
 
 /* ---------------- extraction (DOM + embedded JSON) ---------------- */
 
-async function extractProducts(page, source) {
+export async function extractProducts(page, source) {
   const capturedAt = nowIso();
 
   // 1) Captura possíveis preços via JSON embutido (ld+json)
@@ -177,15 +142,36 @@ async function extractProducts(page, source) {
   });
 
   // 2) Extrai cards e lê preço pelos elementos de dinheiro (mais confiável)
+  const canonicalUrl = value => {
+    try {
+      const url = new URL(value, 'https://www.mercadolivre.com.br');
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch { return null; }
+  };
+  const embeddedPrices = new Map(Object.entries(embeddedPriceMap)
+    .filter(([, price]) => !price.currency || price.currency === 'BRL')
+    .map(([url, price]) => [canonicalUrl(url), price]));
   const rawCards = await page.evaluate(() => {
     function getMoneyAmount(root) {
-      // captura valores de "andes-money-amount" (padrão ML)
-      const moneyBlocks = Array.from(root.querySelectorAll(".andes-money-amount"));
-      // retorna lista de valores em texto (ex.: "R$ 1.199", "R$ 698")
-      const vals = moneyBlocks
-        .map((mb) => mb.innerText?.replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-      return vals;
+      // Read fraction/cents separately: innerText may concatenate 199 + 90 as 19990.
+      const amounts = [];
+      for (const money of root.querySelectorAll(".andes-money-amount")) {
+        // Installment amounts are not a product's current or previous price.
+        if (money.closest('[class*="installment"], [class*="financing"]')) continue;
+        const fraction = money.querySelector('.andes-money-amount__fraction')?.textContent?.trim();
+        const cents = money.querySelector('.andes-money-amount__cents')?.textContent?.trim();
+        const text = fraction
+          ? `${fraction}${cents ? `,${cents}` : ''}`
+          : money.textContent?.trim();
+        const original = !!money.closest('s, del, .andes-money-amount--previous, [class*="original-price"]');
+        amounts.push({ text, original });
+      }
+      return {
+        original: amounts.find(a => a.original)?.text || null,
+        current: amounts.find(a => !a.original)?.text || null
+      };
     }
 
     function getImage(root) {
@@ -196,10 +182,15 @@ async function extractProducts(page, source) {
 
     // tenta achar containers “de card”: elementos que contenham um link de produto + imagem
     const anchors = Array.from(document.querySelectorAll("a[href]"))
-      .filter(a => a.href && /mercadolivre\.com\.br|produto\.mercadolivre\.com\.br/.test(a.href));
+      .filter(a => a.href && /MLB-?\d{6,}/i.test(a.href) && /mercadolivre\.com\.br/.test(a.href));
 
     const cardSet = new Set();
     for (const a of anchors) {
+      const knownCard = a.closest('.poly-card, .promotion-item, .ui-search-result');
+      if (knownCard) {
+        cardSet.add(knownCard);
+        continue;
+      }
       let el = a;
       for (let up = 0; up < 6 && el; up++) {
         const hasImg = !!el.querySelector?.("img");
@@ -216,7 +207,8 @@ async function extractProducts(page, source) {
     const cards = Array.from(cardSet).slice(0, 300);
 
     return cards.map((el, idx) => {
-      const a = el.querySelector("a[href]");
+      const links = [el, ...el.querySelectorAll('a[href]')];
+      const a = links.find(link => link.matches('a[href]') && /MLB-?\d{6,}/i.test(link.href));
       const href = a?.href || null;
 
       const title =
@@ -230,7 +222,7 @@ async function extractProducts(page, source) {
       const img = getImage(el);
 
       // dinheiro/valores
-      const moneyTexts = getMoneyAmount(el);
+      const money = getMoneyAmount(el);
 
       // frete grátis / parcelas / badge do próprio texto
       const freeShipping = /frete\s+gr[aá]tis/i.test(rawText);
@@ -250,7 +242,7 @@ async function extractProducts(page, source) {
         title,
         img,
         rawText,
-        moneyTexts,
+        money,
         freeShipping,
         installments,
         badge
@@ -277,63 +269,23 @@ async function extractProducts(page, source) {
     const product_id = extractProductIdFromUrl(url);
     if (!product_id) continue; // força ficar só produto real
 
-    // (A) tenta pelo DOM money blocks
-    let price_original = null;
-    let price_current = null;
-
-    const moneyTexts = Array.isArray(c.moneyTexts) ? c.moneyTexts : [];
-    // Em geral o ML mostra: [preço riscado, preço atual] ou só [preço atual]
-    if (moneyTexts.length >= 2) {
-      price_original = toNumberFromBRL(moneyTexts[0]);
-      price_current = toNumberFromBRL(moneyTexts[1]);
-      // se por acaso inverter (às vezes o atual vem primeiro), corrige
-      if (price_original != null && price_current != null && price_current > price_original) {
-        const tmp = price_original;
-        price_original = price_current;
-        price_current = tmp;
-      }
-    } else if (moneyTexts.length === 1) {
-      price_current = toNumberFromBRL(moneyTexts[0]);
-    }
+    // Explicit roles in the DOM; never infer the original price by ordering amounts.
+    let price_original = toNumberFromBRL(c.money?.original);
+    let price_current = toNumberFromBRL(c.money?.current);
 
     // (B) fallback: embedded JSON (ld+json) por URL (normaliza comparando sem query)
     if (price_current == null) {
-      const keyVariants = [
-        url,
-        url.split("?")[0],
-        url.replace(/^https?:\/\/(www\.)?/, "https://")
-      ];
-
-      for (const k of keyVariants) {
-        const hit = embeddedPriceMap?.[k];
-        if (hit?.current) {
-          price_current = toNumberFromBRL(hit.current) ?? parseFloat(hit.current);
-          break;
-        }
-      }
+      const hit = embeddedPrices.get(canonicalUrl(url));
+      price_current = toNumberFromJson(hit?.current);
     }
 
-    // (C) último fallback: regex em rawText
-    if (price_current == null || price_original == null) {
-      const text = c.rawText || "";
-      const priceMatches = Array.from(text.matchAll(/R\$\s*[\d.]+(?:,\d{2})?/g)).map(m => m[0]);
-
-      if (price_original == null && price_current == null && priceMatches.length >= 2) {
-        price_original = toNumberFromBRL(priceMatches[0]);
-        price_current = toNumberFromBRL(priceMatches[1]);
-        if (price_original != null && price_current != null && price_current > price_original) {
-          const tmp = price_original;
-          price_original = price_current;
-          price_current = tmp;
-        }
-      } else if (price_current == null && priceMatches.length >= 1) {
-        price_current = toNumberFromBRL(priceMatches[0]);
-      }
-    }
+    // Free-text prices can be installments or shipping. Do not guess from rawText.
+    if (price_current == null) continue;
+    if (price_original != null && price_original <= price_current) price_original = null;
 
     // desconto
     let discount_percent = null;
-    const discMatch = (c.rawText || "").match(/(\d{1,2})\s*%/);
+    const discMatch = (c.rawText || "").match(/\b(\d{1,2})\s*%\s*(?:OFF|de desconto)\b/i);
     if (discMatch) discount_percent = parseInt(discMatch[1], 10);
     if (discount_percent == null) {
       const calc = computeDiscountPercent(price_original, price_current);
@@ -379,89 +331,92 @@ function dedupeProducts(list) {
 
 /* ---------------- page runner ---------------- */
 
-async function scrapePage(context, { source, url }) {
+export async function scrapePage(context, { source, url }) {
   const page = await context.newPage();
-  await page.setExtraHTTPHeaders({
-    "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
-  });
-
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(1500);
-
-  // cookies (se aparecer)
   try {
-    const cookieBtn = page.locator("button:has-text('Aceitar'), button:has-text('Entendi'), button:has-text('Aceito')");
-    if (await cookieBtn.first().isVisible({ timeout: 1500 })) {
-      await cookieBtn.first().click({ timeout: 1500 });
-      await page.waitForTimeout(700);
+    await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en;q=0.8" });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    if (!response || !response.ok()) {
+      throw new Error(`Falha HTTP ${response?.status() ?? 'sem resposta'} ao abrir ${url}`);
     }
-  } catch {}
+    if (/\/(?:login|account-verification|challenge|captcha)(?:[/?#]|$)/i.test(page.url())) {
+      throw new Error(`A coleta foi redirecionada para uma verificação de acesso: ${page.url()}`);
+    }
+    await page.waitForTimeout(1500);
+    try {
+      const cookieBtn = page.locator("button:has-text('Aceitar'), button:has-text('Entendi'), button:has-text('Aceito')").first();
+      if (await cookieBtn.isVisible()) await cookieBtn.click({ timeout: 1500 });
+    } catch { /* Cookie banners are optional. */ }
 
-  await autoScroll(page);
+    await page.locator('.andes-money-amount, script[type="application/ld+json"]').first()
+      .waitFor({ state: 'attached', timeout: 15000 });
+    await autoScroll(page);
+    const products = dedupeProducts(await extractProducts(page, source));
+    if (products.length === 0) {
+      throw new Error('Nenhum produto com preço válido encontrado. Verifique o layout ou uma possível restrição de acesso.');
+    }
+    return { source, url, products };
+  } finally {
+    await page.close();
+  }
+}
 
-  const products = await extractProducts(page, source);
-  await page.close();
+export const targets = [
+  { source: "deal_of_the_day", url: "https://www.mercadolivre.com.br/ofertas?promotion_type=deal_of_the_day" },
+  { source: "lightning", url: "https://www.mercadolivre.com.br/ofertas?promotion_type=lightning" }
+];
 
+export async function scrapeTargets(context, selectedTargets = targets) {
+  const pages = [];
+  for (const target of selectedTargets) {
+    try {
+      pages.push(await scrapePage(context, target));
+    } catch (error) {
+      pages.push({ ...target, products: [], error: String(error?.message || error) });
+    }
+  }
+  const all = dedupeProducts(pages.flatMap(page => page.products));
   return {
-    source,
-    url,
-    products: dedupeProducts(products)
+    site: "mercadolivre.com.br",
+    captured_at: nowIso(),
+    status: pages.length > 0 && pages.every(page => !page.error && page.products.length > 0) ? 'success' : 'failed',
+    pages,
+    total_products: all.length
   };
 }
 
-/* ---------------- main ---------------- */
+export function writeResult(output) {
+  process.stdout.write(JSON.stringify(output, null, 2));
+  for (const page of output.pages) {
+    console.error(`[${page.source}] ${page.error || `${page.products.length} produtos coletados`}`);
+  }
+  if (output.status !== 'success' || output.total_products === 0) process.exitCode = 1;
+}
 
-(async () => {
-  const targets = [
-    {
-      source: "deal_of_the_day",
-      url: "https://www.mercadolivre.com.br/ofertas?promotion_type=deal_of_the_day#filter_applied=promotion_type&filter_position=3&origin=qcat"
-    },
-    {
-      source: "lightning",
-      url: "https://www.mercadolivre.com.br/ofertas?promotion_type=lightning#filter_applied=promotion_type&filter_position=3&origin=qcat"
-    }
-  ];
-
+export async function main() {
+  const { chromium } = await import('playwright');
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"]
   });
-
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1366, height: 768 }
-  });
-
-  const pages = [];
-  for (const t of targets) {
+  try {
+    const context = await browser.newContext({
+      locale: 'pt-BR',
+      viewport: { width: 1366, height: 768 }
+    });
     try {
-      const result = await scrapePage(context, t);
-      pages.push(result);
-    } catch (e) {
-      pages.push({
-        source: t.source,
-        url: t.url,
-        products: [],
-        error: String(e?.message || e)
-      });
+      writeResult(await scrapeTargets(context));
+    } finally {
+      await context.close();
     }
+  } finally {
+    await browser.close();
   }
+}
 
-  await context.close();
-  await browser.close();
-
-  // dedupe global
-  const all = dedupeProducts(pages.flatMap(p => p.products || []));
-
-  const output = {
-    site: "mercadolivre.com.br",
-    captured_at: nowIso(),
-    pages,
-    total_products: all.length
-  };
-
-  // imprime SOMENTE JSON
-  process.stdout.write(JSON.stringify(output, null, 2));
-})();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => {
+    console.error(`Falha na execução: ${error?.message || error}`);
+    process.exitCode = 1;
+  });
+}

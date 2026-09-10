@@ -26,14 +26,17 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: npm ci
 
       - name: Install Playwright Chromium (with deps)
         run: npx playwright install --with-deps chromium
+
+      - name: Test price extraction and failure handling
+        run: npm test
 
       - name: Generate resultado.json
         run: |
@@ -46,6 +49,7 @@ jobs:
           path: public
 
   deploy:
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
